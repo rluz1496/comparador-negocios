@@ -7,7 +7,7 @@ from datetime import datetime
 from dotenv import load_dotenv
 import openai
 
-# Carregar variáveis
+# Carregar variáveis de ambiente
 load_dotenv()
 API_KEY = os.getenv("API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -36,27 +36,7 @@ def get_reviews(cid):
     data = json.loads(res.read())
     return data.get("reviews", [])
 
-def gerar_analise_ia(nome_usuario, nota_usuario, avals_usuario, concorrentes):
-    avals_texto = [f"{r.get('rating')} - {r.get('snippet', '')}" for r in avals_usuario if r.get("snippet")]
-    concorrentes_texto = []
-    for c in concorrentes:
-        avals = get_reviews(c["cid"])
-        trechos = [f"{r.get('rating')} - {r.get('snippet', '')}" for r in avals if r.get("snippet")]
-        concorrentes_texto.append(f"- {c['title']} (nota média: {c.get('rating')}, avaliações: {trechos[:5]})")
-
-    prompt = f"""
-Você é um especialista em análise de negócios. Com base nas avaliações e nas notas médias a seguir, forneça uma análise comparativa entre o negócio do usuário e seus concorrentes. 
-Diga se o negócio está abaixo da média e, se sim, dê sugestões de melhoria com base nas avaliações. 
-Se estiver acima da média, elogie e sugira continuar assim.
-
-Negócio do usuário:
-- Nome: {nome_usuario}
-- Nota média: {nota_usuario}
-- Avaliações: {avals_texto[:5]}
-
-Concorrentes:
-""" + "\n".join(concorrentes_texto[:4])
-
+def openai_call(prompt):
     response = openai.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
@@ -64,7 +44,7 @@ Concorrentes:
             {"role": "user", "content": prompt}
         ],
         temperature=0.7,
-        max_tokens=700
+        max_tokens=600
     )
     return response.choices[0].message.content.strip()
 
@@ -93,43 +73,41 @@ if query:
     st.markdown(f"⭐ **Nota Média:** {selecionado.get('rating', 'N/A')} ({selecionado.get('ratingCount', 0)} avaliações)")
     st.markdown(f"[Abrir no Google Maps](https://www.google.com/maps/search/?api=1&query={selecionado['latitude']},{selecionado['longitude']})")
 
-    # Buscar concorrentes
-    st.subheader("📰 Concorrentes próximos")
+    # Buscar concorrentes com type=maps e parâmetro ll com zoom
     lat = selecionado["latitude"]
     lng = selecionado["longitude"]
     categoria = selecionado.get("category", "")
-
     payload_conc = json.dumps({
         "q": categoria,
         "gl": "br",
         "hl": "pt-br",
-        "type": "places",
-        "location": f"{lat},{lng}",
-        "engine": "google",
+        "type": "maps",
+        "ll": f"@{lat},{lng},14z",
         "num": 10
     })
     conn = http.client.HTTPSConnection("google.serper.dev")
-    conn.request("POST", "/places", payload_conc, HEADERS)
+    conn.request("POST", "/search", payload_conc, HEADERS)
     res = conn.getresponse()
     data = json.loads(res.read())
     concorrentes = data.get("places", [])
 
     df_concorrentes = pd.DataFrame([{
-        "Name": c["title"],
+        "Nome": c["title"],
         "Endereço": c.get("address"),
         "Nota Média": c.get("rating"),
         "Avaliações": c.get("ratingCount"),
         "Categoria": c.get("category")
     } for c in concorrentes])
+    st.subheader("📊 Concorrentes próximos")
     st.dataframe(df_concorrentes, use_container_width=True)
 
     st.subheader("📝 Comparativo de Avaliações")
     st.caption("Visualize lado a lado as avaliações recentes do seu negócio e dos concorrentes.")
 
     colunas = st.columns(len(concorrentes[:4]) + 1)
+    user_reviews = get_reviews(selecionado['cid'])
     with colunas[0]:
         st.markdown(f"#### 🏢 {selecionado['title']}")
-        user_reviews = get_reviews(selecionado['cid'])
         for r in user_reviews[:10]:
             nome = r.get("user", {}).get("name", "?")
             nota = r.get("rating", "?")
@@ -148,12 +126,22 @@ if query:
                 texto = r.get("snippet", "")
                 st.markdown(f"**⭐ {nota} | 🧍 {nome} | 🕒 {data}**\n> {texto}")
 
-    st.subheader("🤖 Análise da IA")
-    with st.spinner("Gerando análise com inteligência artificial..."):
-        analise = gerar_analise_ia(
-            nome_usuario=selecionado["title"],
-            nota_usuario=selecionado.get("rating", "N/A"),
-            avals_usuario=user_reviews,
-            concorrentes=concorrentes[:4]
-        )
-        st.markdown(analise)
+    if st.button("🤖 Gerar análise com IA"):
+        with st.spinner("Gerando análise com inteligência artificial..."):
+            user_avals = [f"{r.get('rating')} - {r.get('snippet', '')}" for r in user_reviews if r.get("snippet")]
+            concorrentes_data = []
+            for c in concorrentes[:4]:
+                avals = get_reviews(c["cid"])
+                trechos = [f"{r.get('rating')} - {r.get('snippet', '')}" for r in avals if r.get("snippet")]
+                concorrentes_data.append({"nome": c["title"], "nota": c.get("rating"), "reviews": trechos[:5]})
+
+            partes = []
+            partes.append(openai_call(f"Compare a nota média do negócio '{selecionado['title']}' ({selecionado.get('rating')}) com os concorrentes: {[(c['nome'], c['nota']) for c in concorrentes_data]}"))
+            partes.append(openai_call(f"Analise as avaliações dos clientes do negócio '{selecionado['title']}' e identifique pontos fortes e fracos: {user_avals[:5]}"))
+            partes.append(openai_call(f"Com base nas avaliações dos concorrentes ({[(c['nome'], c['nota']) for c in concorrentes_data]}), diga o que os clientes elogiam mais e o que pode ser aprendido."))
+            partes.append(openai_call(f"Sugira melhorias para o negócio '{selecionado['title']}' com base nas comparações anteriores."))
+            partes.append(openai_call(f"Escreva uma conclusão executiva com base em todas as análises anteriores sobre o negócio '{selecionado['title']}'."))
+
+            st.subheader("🧠 Análise da IA")
+            for i, parte in enumerate(partes):
+                st.info(parte)
